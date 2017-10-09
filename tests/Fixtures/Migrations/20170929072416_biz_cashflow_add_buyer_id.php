@@ -2,7 +2,7 @@
 
 use Phpmig\Migration\Migration;
 
-class BizOrderAddDisplayStatus extends Migration
+class BizCashflowAddBuyerId extends Migration
 {
     /**
      * Do the migration
@@ -10,11 +10,12 @@ class BizOrderAddDisplayStatus extends Migration
     public function up()
     {
         $biz = $this->getContainer();
-        $db = $biz['db'];
+        $connection = $biz['db'];
 
-        if (!$this->isFieldExist('biz_order', 'display_status')) {
-            $db->exec("ALTER TABLE `biz_order` ADD COLUMN `display_status` varchar(32) NOT NULL DEFAULT 'no_paid' COMMENT '订单显示状态(no_paid,paid,refunding,closed,refunded)' AFTER `status`");
+        if (!$this->isFieldExist('biz_user_cashflow', 'buyer_id')) {
+            $connection->exec("ALTER TABLE `biz_user_cashflow` ADD COLUMN `buyer_id` INT(10) unsigned NOT NULL DEFAULT '0' COMMENT '买家'");
         }
+
     }
 
     /**
@@ -23,9 +24,9 @@ class BizOrderAddDisplayStatus extends Migration
     public function down()
     {
         $biz = $this->getContainer();
-        $db = $biz['db'];
+        $connection = $biz['db'];
 
-        $db->exec("ALTER TABLE `biz_order` DROP COLUMN `display_status`;");
+        $connection->exec('ALTER TABLE `biz_user_cashflow` DROP COLUMN `buyer_id`;');
     }
 
     protected function isFieldExist($table, $filedName)

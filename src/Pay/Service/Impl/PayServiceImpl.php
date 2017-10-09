@@ -12,7 +12,7 @@ use Codeages\Biz\Framework\Targetlog\Service\TargetlogService;
 
 class PayServiceImpl extends BaseService implements PayService
 {
-    public function createTrade($data)
+    public function createTrade($data, $createPlatformTrade = true)
     {
         $data = ArrayToolkit::parts($data, array(
             'goods_title',
@@ -36,15 +36,15 @@ class PayServiceImpl extends BaseService implements PayService
         ));
 
         if ('recharge' == $data['type']) {
-            return $this->createRechargeTrade($data);
+            return $this->createRechargeTrade($data, $createPlatformTrade);
         } else if ('purchase' == $data['type']) {
-            return $this->createPurchaseTrade($data);
+            return $this->createPurchaseTrade($data, $createPlatformTrade);
         } else {
             throw new InvalidArgumentException("can't create the type of {$data['type']} trade");
         }
     }
 
-    protected function createPurchaseTrade($data)
+    protected function createPurchaseTrade($data, $createPlatformTrade)
     {
         $lock = $this->biz['lock'];
 
@@ -54,19 +54,8 @@ class PayServiceImpl extends BaseService implements PayService
 
             $trade = $this->createPaymentTrade($data);
 
-            if ($trade['cash_amount'] != 0) {
+            if ($trade['cash_amount'] > 0 && $createPlatformTrade) {
                 $trade = $this->createPaymentPlatformTrade($data, $trade);
-            } else {
-                $mockNotify = array(
-                    'status' => 'paid',
-                    'paid_time' => time(),
-                    'cash_flow' => '',
-                    'cash_type' => '',
-                    'trade_sn' => $trade['trade_sn'],
-                    'pay_amount' => '0',
-                );
-
-                $trade = $this->updateTradeToPaid($mockNotify);
             }
 
             $this->commit();
@@ -81,7 +70,7 @@ class PayServiceImpl extends BaseService implements PayService
         return $trade;
     }
 
-    protected function createRechargeTrade($data)
+    protected function createRechargeTrade($data, $createPlatformTrade)
     {
         $lock = $this->biz['lock'];
 
@@ -92,7 +81,9 @@ class PayServiceImpl extends BaseService implements PayService
             $this->beginTransaction();
             $trade = $this->createPaymentTrade($data);
 
-            $trade = $this->createPaymentPlatformTrade($data, $trade);
+            if ($createPlatformTrade) {
+                $trade = $this->createPaymentPlatformTrade($data, $trade);
+            }
 
             $this->commit();
             $lock->release($lockName);
@@ -112,7 +103,11 @@ class PayServiceImpl extends BaseService implements PayService
     public function queryTradeFromPlatform($tradeSn)
     {
         $trade = $this->getPaymentTradeDao()->getByTradeSn($tradeSn);
-        return $this->getPayment($trade['platform'])->queryTrade($trade);
+        $result = $this->getPayment($trade['platform'])->queryTrade($tradeSn);
+        if (!empty($result)) {
+            return $this->updateTradeToPaid($result);
+        }
+        return $trade;
     }
 
     public function findTradesByOrderSns($orderSns)
@@ -147,6 +142,20 @@ class PayServiceImpl extends BaseService implements PayService
 
     public function notifyPaid($payment, $data)
     {
+        if ($payment == 'coin') {
+            $mockNotify = array(
+                'status' => 'paid',
+                'paid_time' => time(),
+                'cash_flow' => '',
+                'cash_type' => '',
+                'trade_sn' => $data['trade_sn'],
+                'pay_amount' => '0',
+            );
+
+            $trade = $this->updateTradeToPaid($mockNotify);
+            return $trade;
+        }
+
         list($data, $result) = $this->getPayment($payment)->converterNotify($data);
         $this->getTargetlogService()->log(TargetlogService::INFO, 'trade.paid_notify', $data['trade_sn'], "收到第三方支付平台{$payment}的通知，交易号{$data['trade_sn']}，支付状态{$data['status']}", $data);
 
@@ -181,7 +190,7 @@ class PayServiceImpl extends BaseService implements PayService
 
     protected function isCloseByPayment()
     {
-        return empty($this->biz['payment.final_options']['closed_notify']) ? false : $this->biz['payment.final_options']['closed_notify'];
+        return empty($this->biz['payment.final_options']['closed_by_notify']) ? false : $this->biz['payment.final_options']['closed_by_notify'];
     }
 
     protected function closeByPayment($trade)
@@ -285,7 +294,7 @@ class PayServiceImpl extends BaseService implements PayService
 
     protected function isRefundByPayment()
     {
-        return empty($this->biz['payment.final_options']['refunded_notify']) ? false : $this->biz['payment.final_options']['refunded_notify'];
+        return empty($this->biz['payment.final_options']['refunded_by_notify']) ? false : $this->biz['payment.final_options']['refunded_by_notify'];
     }
 
     protected function refundByPayment($trade)
@@ -318,6 +327,7 @@ class PayServiceImpl extends BaseService implements PayService
             'platform' => $trade['platform'],
             'parent_sn' => '',
             'currency' => $trade['currency'],
+            'buyer_id' => $trade['user_id'],
         );
         $flow = $this->getAccountService()->transferCash($fields);
 
@@ -330,7 +340,8 @@ class PayServiceImpl extends BaseService implements PayService
                 'trade_sn' => $trade['trade_sn'],
                 'order_sn' => $trade['order_sn'],
                 'platform' => $trade['platform'],
-                'parent_sn' => $flow['sn']
+                'parent_sn' => $flow['sn'],
+                'buyer_id' => $trade['user_id'],
             );
             $this->getAccountService()->transferCoin($fields);
         }
@@ -408,16 +419,29 @@ class PayServiceImpl extends BaseService implements PayService
 
     protected function transfer($trade)
     {
+
         if (!empty($trade['cash_amount'])) {
             $fields = array(
+                'user_id' => $trade['user_id'],
+                'amount' => $trade['cash_amount'],
+                'title' => $trade['title'],
+                'currency' => $trade['currency'],
+                'platform' => $trade['platform'],
+                'trade_sn' => $trade['trade_sn'],
+                'order_sn' => $trade['order_sn'],
+            );
+            $flow = $this->getAccountService()->rechargeCash($fields);
+
+            $fields = array(
                 'from_user_id' => $trade['user_id'],
+                'buyer_id' => $trade['user_id'],
                 'to_user_id' => $trade['seller_id'],
                 'amount' => $trade['cash_amount'],
                 'title' => $trade['title'],
                 'trade_sn' => $trade['trade_sn'],
                 'order_sn' => $trade['order_sn'],
                 'platform' => $trade['platform'],
-                'parent_sn' => '',
+                'parent_sn' => $flow['sn'],
                 'currency' => $trade['currency']
             );
             $flow = $this->getAccountService()->transferCash($fields);
@@ -428,6 +452,7 @@ class PayServiceImpl extends BaseService implements PayService
                 $fields = array(
                     'from_user_id' => $trade['seller_id'],
                     'to_user_id' => $trade['user_id'],
+                    'buyer_id' => $trade['user_id'],
                     'amount' => $trade['cash_amount'] * $this->getDefaultCoinRate(),
                     'title' => $trade['title'],
                     'trade_sn' => $trade['trade_sn'],
@@ -445,6 +470,7 @@ class PayServiceImpl extends BaseService implements PayService
                 $fields = array(
                     'from_user_id' => $trade['user_id'],
                     'to_user_id' => $trade['seller_id'],
+                    'buyer_id' => $trade['user_id'],
                     'amount' => $trade['coin_amount'],
                     'title' => $trade['title'],
                     'trade_sn' => $trade['trade_sn'],
